@@ -1,143 +1,116 @@
-/* ===========================================================
-   Express + SQLite REST API – ready for Render.com
-   Now with gender & age columns
-   =========================================================== */
-
+/* ==========  Express + SQLite backend  ========== */
 const express  = require('express');
 const sqlite3  = require('sqlite3').verbose();
 const path     = require('path');
-// const cors  = require('cors');            // optional
 
 const app  = express();
-const PORT = process.env.PORT || 3002;     // Render injects PORT
+const PORT = process.env.PORT || 3002;
 
 /* ---------- middleware ---------- */
 app.use(express.json());
-// app.use(cors());
-
-/* Serve static front-end assets (index.html, JS, CSS, …) */
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static('public'));   // serves index.html & assets
 
 /* ---------- database ---------- */
-const dbPath = path.join(__dirname, 'employees.db');
+const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/employees.db' : './employees.db';
 const db = new sqlite3.Database(dbPath, err => {
-  if (err) {
-    console.error('❌ SQLite connection error:', err.message);
-  } else {
-    console.log('✅ Connected to SQLite');
-  }
+  if (err) console.error('❌ DB open error:', err.message);
 });
 
-/* Create table if it doesn’t exist */
+
+/* employees table with UNIQUE e-mail (case-insensitive) */
 db.run(`
   CREATE TABLE IF NOT EXISTS employees (
-    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    name   TEXT    NOT NULL,
-    email  TEXT    NOT NULL UNIQUE,
-    role   TEXT,
-    gender TEXT,
-    age    INTEGER
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    email      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    gender     TEXT    NOT NULL CHECK (gender IN ('Male','Female')),
+    age        INTEGER NOT NULL CHECK (age BETWEEN 18 AND 65),
+    department TEXT    NOT NULL
   )
-`, err => {
-  if (err) console.error('❌ Table create error:', err.message);
+`);
+
+/* ---------- helpers ---------- */
+const NAME_RE = /^[A-Za-z][A-Za-z .'-]{1,48}$/;      // 2-50 chars, letters only
+const DEPT_RE = NAME_RE;                             // same rule as name
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function allFieldsPresent(o) {
+  return ['name','email','gender','age','department']
+         .every(k => o[k] !== undefined && o[k] !== '');
+}
+function fieldValid({ name, email, gender, age, department }) {
+  if (!NAME_RE.test(name))                  return 'Name must contain letters only (2-50).';
+  if (!DEPT_RE.test(department))            return 'Department: letters only (2-50).';
+  if (!EMAIL_RE.test(email))                return 'Invalid e-mail address.';
+  if (!['Male','Female'].includes(gender))  return 'Gender must be Male or Female.';
+  if (age < 18 || age > 65)                 return 'Age must be between 18 and 65.';
+  return null;
+}
+
+/* ---------- routes ---------- */
+app.post('/api/employees', (req, res) => {
+  const errMsg = !allFieldsPresent(req.body) ? 'All fields are required.' :
+                 fieldValid(req.body);
+  if (errMsg) return res.status(400).json({ error: errMsg });
+
+  const { name, email, gender, age, department } = req.body;
+  const stmt = db.prepare(
+    `INSERT INTO employees (name, email, gender, age, department)
+     VALUES (?, ?, ?, ?, ?)`
+  );
+  stmt.run(name, email, gender, age, department, function (err) {
+    if (err) {
+      if (err.code === 'SQLITE_CONSTRAINT')
+        return res.status(409).json({ error: 'Email already exists.' });
+      return res.status(500).json({ error: 'Failed to insert employee.' });
+    }
+    res.json({ id: this.lastID, ...req.body });
+  });
 });
 
-/* ---------- health-check (Render pings "/") ---------- */
-app.get('/', (_, res) => res.send('API up and running'));
-
-/* ===========================================================
-   REST endpoints – CRUD for /employees
-   =========================================================== */
-
-/* GET all employees */
-app.get('/employees', (_, res) => {
-  db.all('SELECT * FROM employees', (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+app.get('/api/employees', (_req, res) => {
+  db.all('SELECT * FROM employees ORDER BY id', (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Failed to fetch employees.' });
     res.json(rows);
   });
 });
 
-/* GET one employee by id */
-app.get('/employees/:id', (req, res) => {
-  db.get('SELECT * FROM employees WHERE id = ?', [req.params.id], (err, row) => {
-    if (err)  return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Employee not found' });
-    res.json(row);
-  });
-});
+app.put('/api/employees/:id', (req, res) => {
+  const errMsg = !allFieldsPresent(req.body) ? 'All fields are required.' :
+                 fieldValid(req.body);
+  if (errMsg) return res.status(400).json({ error: errMsg });
 
-/* POST create new employee */
-app.post('/employees', (req, res) => {
-  const { name, email, role, gender, age } = req.body;
-  if (!name || !email)
-    return res.status(400).json({ error: 'Name and email are required' });
+  const { id } = req.params;
+  const { name, email, gender, age, department } = req.body;
 
-  const sql = `
-    INSERT INTO employees (name, email, role, gender, age)
-    VALUES (?, ?, ?, ?, ?)
-  `;
-  const params = [name, email, role || null, gender || null, age || null];
-
-  db.run(sql, params, function (err) {
-    if (err) {
-      if (err.message.includes('UNIQUE')) {
-        return res.status(409).json({ error: 'Email already exists' });
+  db.run(
+    `UPDATE employees
+       SET name = ?, email = ?, gender = ?, age = ?, department = ?
+     WHERE id = ?`,
+    [name, email, gender, age, department, id],
+    function (err) {
+      if (err) {
+        if (err.code === 'SQLITE_CONSTRAINT')
+          return res.status(409).json({ error: 'Email already exists.' });
+        return res.status(500).json({ error: 'Failed to update employee.' });
       }
-      return res.status(500).json({ error: err.message });
+      if (this.changes === 0)
+        return res.status(404).json({ error: 'Employee not found.' });
+      res.json({ id: Number(id), ...req.body });
     }
-    /* this.lastID is the row id just inserted */
-    db.get('SELECT * FROM employees WHERE id = ?', [this.lastID], (_, row) =>
-      res.status(201).json(row)
-    );
-  });
+  );
 });
 
-/* PUT update employee */
-app.put('/employees/:id', (req, res) => {
-  const { name, email, role, gender, age } = req.body;
-  const id = req.params.id;
-
-  const sql = `
-    UPDATE employees
-    SET name = ?, email = ?, role = ?, gender = ?, age = ?
-    WHERE id = ?
-  `;
-  const params = [name, email, role, gender, age, id];
-
-  db.run(sql, params, function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes)
-      return res.status(404).json({ error: 'Employee not found' });
-
-    db.get('SELECT * FROM employees WHERE id = ?', [id], (_, row) =>
-      res.json(row)
-    );
+app.delete('/api/employees/:id', (req, res) => {
+  db.run('DELETE FROM employees WHERE id = ?', req.params.id, function (err) {
+    if (err) return res.status(500).json({ error: 'Failed to delete employee.' });
+    if (this.changes === 0)
+      return res.status(404).json({ error: 'Employee not found.' });
+    res.json({ success: true });
   });
 });
-
-/* DELETE employee */
-app.delete('/employees/:id', (req, res) => {
-  db.run('DELETE FROM employees WHERE id = ?', [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes)
-      return res.status(404).json({ error: 'Employee not found' });
-    res.json({ message: 'Employee deleted' });
-  });
-});
-
-/* ===========================================================
-   graceful shutdown – close the DB before Node exits
-   =========================================================== */
-const closeDb = () =>
-  db.close(() => console.log('🛑 SQLite connection closed'));
-process.on('SIGTERM', closeDb);
-process.on('SIGINT',  closeDb);
 
 /* ---------- start server ---------- */
-app.listen(PORT, () =>
-  console.log(`⚡ Server listening on port ${PORT}`)
-);
-
-/* ===========================================================
-   End of file
-   =========================================================== */
+app.listen(PORT, () => {
+  console.log(`✅  Server running at http://localhost:${PORT}`);
+});
